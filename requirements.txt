@@ -1,0 +1,9 @@
+streamlit
+pandas
+sqlalchemy
+plotly
+google-genai
+groq
+pdfplumber
+python-dotenv
+PyMuPDF
