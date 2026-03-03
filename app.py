@@ -1,11 +1,12 @@
 import streamlit as st
 import pandas as pd
-from database import init_db, get_db, Report, TestMetric
+from database import get_db_session, Report, TestMetric
 from ai_engine import (
     parse_pdf_with_gemini, parse_pdf_with_groq, 
     refine_parse_with_gemini, get_mock_data,
     validate_gemini_key, validate_groq_key
 )
+from viz_engine import plot_metric_trend, plot_pass_rate_pie
 import os
 import datetime
 import base64
@@ -18,71 +19,77 @@ st.set_page_config(
     layout="wide"
 )
 
-# 初始化資料庫與資料夾
-init_db()
-if not os.path.exists("reports"):
-    os.makedirs("reports")
+# --- 簡易登入機制 ---
+if "user_name" not in st.session_state:
+    st.title("🚀 智慧測試報告管理系統")
+    st.subheader("歡迎使用！請輸入您的帳號進行登入或註冊")
+    
+    with st.form("login_form"):
+        u_name = st.text_input("使用者名稱 (帳號唯一，若不存在則會自動註冊)", placeholder="例如: User01")
+        login_btn = st.form_submit_button("進入系統")
+        
+        if login_btn:
+            if u_name.strip():
+                st.session_state.user_name = u_name.strip()
+                st.rerun()
+            else:
+                st.error("請輸入有效的使用者名稱")
+    
+    st.info("💡 說明：本系統採帳號隔離機制，不同帳號將擁有獨立的資料庫與 PDF 儲存空間。")
+    st.stop() # 阻斷後續程式碼執行
+
+# --- 登入後的變數設定 ---
+current_user = st.session_state.user_name
+user_report_dir = f"reports/{current_user}"
+if not os.path.exists(user_report_dir):
+    os.makedirs(user_report_dir)
 
 # --- 側邊欄：BYOK 金鑰驗證與引擎選擇 ---
-st.sidebar.title("🚀 Smart TRMS")
-st.sidebar.info("🧪 **BYOK 隱私模式**：金鑰僅存於本次 Session，重整網頁即清除。")
+st.sidebar.title(f"👤 您好, {current_user}")
+if st.sidebar.button("登出"):
+    del st.session_state.user_name
+    st.rerun()
 
-# 選擇引擎
+st.sidebar.divider()
+st.sidebar.info("🧪 **BYOK 隱私模式**：金鑰僅存於本次 Session。")
+
 ai_provider = st.sidebar.radio("選擇 AI 引擎", ["Gemini 3 Flash", "Groq (Llama-3.1 8B)"])
 
-# 驗證狀態儲存
 if "gemini_valid" not in st.session_state: st.session_state.gemini_valid = False
 if "groq_valid" not in st.session_state: st.session_state.groq_valid = False
 
-# 動態金鑰輸入與驗證
 if ai_provider == "Gemini 3 Flash":
-    user_key = st.sidebar.text_input("輸入 Gemini API Key (Enter 驗證)", type="password")
+    user_key = st.sidebar.text_input("輸入 Gemini API Key", type="password")
     if user_key:
-        with st.sidebar:
-            with st.spinner("正在驗證金鑰..."):
-                valid, msg = validate_gemini_key(user_key)
-                if valid:
-                    st.success("✅ 金鑰驗證成功 (綠燈)")
-                    st.session_state.gemini_api_key = user_key
-                    st.session_state.gemini_valid = True
-                else:
-                    st.error(f"❌ 驗證失敗: {msg}")
-                    st.session_state.gemini_valid = False
-    elif st.session_state.gemini_valid:
-        st.sidebar.success("✅ 金鑰已就緒")
+        valid, msg = validate_gemini_key(user_key)
+        if valid:
+            st.sidebar.success("✅ 金鑰驗證成功")
+            st.session_state.gemini_api_key = user_key
+            st.session_state.gemini_valid = True
+        else:
+            st.sidebar.error(f"❌ 驗證失敗: {msg}")
+            st.session_state.gemini_valid = False
 else:
-    user_key = st.sidebar.text_input("輸入 Groq API Key (Enter 驗證)", type="password")
+    user_key = st.sidebar.text_input("輸入 Groq API Key", type="password")
     if user_key:
-        with st.sidebar:
-            with st.spinner("正在驗證金鑰..."):
-                valid, msg = validate_groq_key(user_key)
-                if valid:
-                    st.success("✅ 金鑰驗證成功 (綠燈)")
-                    st.session_state.groq_api_key = user_key
-                    st.session_state.groq_valid = True
-                else:
-                    st.error(f"❌ 驗證失敗: {msg}")
-                    st.session_state.groq_valid = False
-    elif st.session_state.groq_valid:
-        st.sidebar.success("✅ 金鑰已就緒")
+        valid, msg = validate_groq_key(user_key)
+        if valid:
+            st.sidebar.success("✅ 金鑰驗證成功")
+            st.session_state.groq_api_key = user_key
+            st.session_state.groq_valid = True
+        else:
+            st.sidebar.error(f"❌ 驗證失敗: {msg}")
+            st.session_state.groq_valid = False
 
-page = st.sidebar.selectbox(
-    "導航選單",
-    ["📊 數據看板 (Dashboard)", "📤 報告上傳 (Upload)", "📂 數位檔案庫 (Archive)"]
-)
+page = st.sidebar.selectbox("導航選單", ["📊 數據看板 (Dashboard)", "📤 報告上傳 (Upload)", "📂 數位檔案庫 (Archive)"])
 
-# 協助檢查驗證狀態
 def is_ready():
-    if ai_provider == "Gemini 3 Flash":
-        return st.session_state.gemini_valid
-    else:
-        return st.session_state.groq_valid
+    return st.session_state.gemini_valid if ai_provider == "Gemini 3 Flash" else st.session_state.groq_valid
 
 # --- 1. 數據看板 ---
 if page == "📊 數據看板 (Dashboard)":
-    st.header("數據看板")
-    db_gen = get_db()
-    db = next(db_gen)
+    st.header(f"📊 {current_user} 的數據看板")
+    db = get_db_session(current_user)
     col_stat1, col_stat2 = st.columns([1, 2])
     with col_stat1:
         pie_fig = plot_pass_rate_pie(db)
@@ -100,131 +107,84 @@ if page == "📊 數據看板 (Dashboard)":
 
 # --- 2. 報告上傳 ---
 elif page == "📤 報告上傳 (Upload)":
-    st.header(f"報告上傳與 AI 智慧解析 ({ai_provider})")
-    
+    st.header(f"📤 報告上傳 ({ai_provider})")
     if not is_ready():
-        st.error(f"❌ **尚未偵測到有效的 {ai_provider} 金鑰。**")
-        st.warning("請在左側邊欄輸入 API 金鑰並按下 **Enter** 進行驗證（綠燈亮起後即可使用）。")
-        if st.button("💡 了解 BYOK 隱私模式"):
-            st.info("您的金鑰僅會暫存於瀏覽器記憶體中，用於向 AI 發送請求。我們不會將金鑰儲存在任何資料庫或伺服器硬碟中。")
+        st.error(f"❌ 請先在左側輸入並驗證 {ai_provider} API Key。")
     else:
-        report_type = st.selectbox("選擇報告領域", ["通用", "電子零件", "材料分析", "醫療器材"])
         uploaded_file = st.file_uploader("選擇 PDF 測試報告", type=["pdf"])
-        
         if uploaded_file is not None:
             file_bytes = uploaded_file.read()
             current_key = st.session_state.gemini_api_key if ai_provider == "Gemini 3 Flash" else st.session_state.groq_api_key
-            
-            if 'ai_results' not in st.session_state or st.session_state.get('last_file') != uploaded_file.name or st.session_state.get('last_provider') != ai_provider:
-                with st.status(f"AI 正在解析中...") as status:
+            if 'ai_results' not in st.session_state or st.session_state.get('last_file') != uploaded_file.name:
+                with st.status("AI 解析中...") as status:
                     try:
                         if ai_provider == "Gemini 3 Flash": res = parse_pdf_with_gemini(file_bytes, current_key)
                         else: res = parse_pdf_with_groq(file_bytes, current_key)
-                        
-                        if "error" in res:
-                            st.warning(res["error"])
-                            res = get_mock_data()
-                        
-                        if isinstance(res, list) and len(res) > 0: res = res[0]
-                        elif not isinstance(res, dict): res = get_mock_data()
+                        if "error" in res: res = get_mock_data()
+                        if isinstance(res, list): res = res[0]
                         st.session_state.ai_results = res
                     except: st.session_state.ai_results = get_mock_data()
                     st.session_state.last_file = uploaded_file.name
-                    st.session_state.last_provider = ai_provider
                     status.update(label="解析完成！", state="complete")
 
             col1, col2 = st.columns([1, 1])
             with col1:
-                st.subheader("📄 原始文件預覽")
+                st.subheader("📄 PDF 預覽")
                 base64_pdf = base64.b64encode(file_bytes).decode('utf-8')
                 st.markdown(f'<embed src="data:application/pdf;base64,{base64_pdf}" width="100%" height="700" type="application/pdf">', unsafe_allow_html=True)
-                
             with col2:
-                st.subheader("📝 AI 辨識結果與對話修正")
-                user_msg = st.chat_input("對 AI 下達修正指令...")
-                if user_msg:
-                    with st.spinner("重新審查中..."):
-                        if ai_provider == "Gemini 3 Flash":
-                            refined = refine_parse_with_gemini(file_bytes, st.session_state.ai_results, user_msg, current_key)
-                            if "error" not in refined:
-                                st.session_state.ai_results = refined
-                                st.success("數據已更新！")
-                            else: st.error(refined["error"])
-                        else: st.info("目前僅 Gemini 支援對話式修正。")
-
                 with st.form("confirm_form"):
-                    data = st.session_state.ai_results
-                    r_no = st.text_input("報告編號", value=data.get("report_number", ""))
-                    model = st.text_input("產品型號", value=data.get("product_model", ""))
-                    lab = st.text_input("實驗室", value=data.get("laboratory", ""))
-                    try: t_date = datetime.datetime.strptime(data.get("test_date", "2023-01-01"), "%Y-%m-%d").date()
+                    d = st.session_state.ai_results
+                    r_no = st.text_input("報告編號", value=d.get("report_number", ""))
+                    model = st.text_input("產品型號", value=d.get("product_model", ""))
+                    lab = st.text_input("實驗室", value=d.get("laboratory", ""))
+                    try: t_date = datetime.datetime.strptime(d.get("test_date", "2023-01-01"), "%Y-%m-%d").date()
                     except: t_date = datetime.date.today()
                     test_date = st.date_input("測試日期", value=t_date)
-                    res = st.selectbox("整體判定", ["Pass", "Fail"], index=0 if data.get("overall_result") == "Pass" else 1)
-                    summ = st.text_area("結論摘要", value=data.get("ai_summary", ""))
-                    m_df = pd.DataFrame(data.get("metrics", []))
-                    edited_m = st.data_editor(m_df, num_rows="dynamic", key="m_editor_upload")
+                    res = st.selectbox("判定", ["Pass", "Fail"], index=0 if d.get("overall_result") == "Pass" else 1)
+                    summ = st.text_area("摘要", value=d.get("ai_summary", ""))
+                    m_df = pd.DataFrame(d.get("metrics", []))
+                    edited_m = st.data_editor(m_df, num_rows="dynamic")
                     
-                    if st.form_submit_button("確認入庫並儲存 PDF"):
-                        db_gen = get_db()
-                        db = next(db_gen)
+                    if st.form_submit_button("確認入庫"):
+                        db = get_db_session(current_user)
                         try:
-                            safe_r_no = r_no.replace("/", "-").replace("\\", "-").strip()
-                            save_path = f"reports/{safe_r_no}.pdf"
+                            safe_no = r_no.replace("/", "-")
+                            save_path = f"{user_report_dir}/{safe_no}.pdf"
                             with open(save_path, "wb") as f: f.write(file_bytes)
-                            new_r = Report(
-                                report_number=r_no, product_model=model, laboratory=lab,
-                                test_date=test_date, overall_result=res, ai_summary=summ,
-                                file_path=save_path, status='已確認'
-                            )
+                            new_r = Report(report_number=r_no, product_model=model, laboratory=lab, test_date=test_date, overall_result=res, ai_summary=summ, file_path=save_path)
                             db.add(new_r)
                             db.flush()
                             for _, row in edited_m.iterrows():
-                                db.add(TestMetric(
-                                    report_id=new_r.id, metric_name=row['metric_name'],
-                                    metric_value=str(row['metric_value']), unit=row['unit'], is_pass=row['is_pass']
-                                ))
+                                db.add(TestMetric(report_id=new_r.id, metric_name=row['metric_name'], metric_value=str(row['metric_value']), unit=row['unit'], is_pass=row['is_pass']))
                             db.commit()
-                            st.success(f"入庫成功！檔案：{save_path}")
+                            st.success(f"已存入 {current_user} 的資料庫。")
                             st.balloons()
-                        except Exception as e:
-                            db.rollback()
-                            st.error(f"錯誤: {e}")
+                        except Exception as e: st.error(f"錯誤: {e}")
                         finally: db.close()
 
 # --- 3. 數位檔案庫 ---
 elif page == "📂 數位檔案庫 (Archive)":
-    st.header("數位檔案庫管理")
-    db_gen = get_db()
-    db = next(db_gen)
+    st.header(f"📂 {current_user} 的檔案庫")
+    db = get_db_session(current_user)
     reports = db.query(Report).all()
-    if not reports:
-        st.warning("暫無資料。")
+    if not reports: st.warning("暫無資料。")
     else:
-        df = pd.DataFrame([{"ID": r.id, "報告編號": r.report_number, "型號": r.product_model, "結果": r.overall_result, "日期": r.test_date} for r in reports])
+        df = pd.DataFrame([{"ID": r.id, "報告編號": r.report_number, "日期": r.test_date} for r in reports])
         st.dataframe(df, use_container_width=True)
-        st.divider()
-        col_sel, col_del = st.columns([3, 1])
-        with col_sel: selected_id = st.selectbox("選擇報告", df["ID"])
-        if selected_id:
-            curr = db.query(Report).filter(Report.id == selected_id).first()
-            with col_del:
-                st.write("")
-                if st.button("🗑️ 刪除"):
-                    try:
-                        if curr.file_path and os.path.exists(curr.file_path): os.remove(curr.file_path)
-                        db.delete(curr)
-                        db.commit()
-                        st.success("已刪除。")
-                        st.rerun()
-                    except Exception as e: st.error(f"失敗: {e}")
+        sel_id = st.selectbox("選擇報告", df["ID"])
+        if sel_id:
+            curr = db.query(Report).filter(Report.id == sel_id).first()
+            if st.button("🗑️ 刪除"):
+                if curr.file_path and os.path.exists(curr.file_path): os.remove(curr.file_path)
+                db.delete(curr); db.commit()
+                st.rerun()
             c1, c2 = st.columns([1, 1])
             with c1:
                 if curr.file_path and os.path.exists(curr.file_path):
                     with open(curr.file_path, "rb") as f: b64 = base64.b64encode(f.read()).decode('utf-8')
                     st.markdown(f'<embed src="data:application/pdf;base64,{b64}" width="100%" height="600" type="application/pdf">', unsafe_allow_html=True)
             with c2:
-                st.info(f"**AI 結論：** {curr.ai_summary}")
-                m_list = db.query(TestMetric).filter(TestMetric.report_id == selected_id).all()
-                st.table(pd.DataFrame([{"指標": m.metric_name, "數值": m.metric_value, "單位": m.unit, "判定": "✅" if m.is_pass else "❌"} for m in m_list]))
+                m_list = db.query(TestMetric).filter(TestMetric.report_id == sel_id).all()
+                st.table(pd.DataFrame([{"指標": m.metric_name, "數值": m.metric_value, "單位": m.unit} for m in m_list]))
     db.close()
